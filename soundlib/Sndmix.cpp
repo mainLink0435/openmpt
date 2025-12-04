@@ -302,7 +302,13 @@ samplecount_t CSoundFile::Read(samplecount_t count, IAudioTarget &target, IAudio
 			inputMonitor->get().Process(mpt::audio_span_planar<const mixsample_t>(buffers, m_MixerSettings.NumInputChannels, countChunk));
 		}
 
-		CreateStereoMix(countChunk);
+		if(m_MixerSettings.gnChannels == 6)
+		{
+			CreateSurroundMix(countChunk);
+		} else
+		{
+			CreateStereoMix(countChunk);
+		}
 
 		if(m_opl)
 		{
@@ -350,6 +356,20 @@ samplecount_t CSoundFile::Read(samplecount_t count, IAudioTarget &target, IAudio
 		if(m_MixerSettings.gnChannels == 4)
 		{
 			InterleaveFrontRear(MixSoundBuffer, MixRearBuffer, countChunk);
+		}
+
+		if(m_MixerSettings.gnChannels == 6)
+		{
+			// Interleave 6-channel surround: FL, FR, C, LFE, SL, SR
+			for(samplecount_t i = 0; i < countChunk; i++)
+			{
+				MixSoundBuffer[i*6+0] = MixSurroundFL[i];
+				MixSoundBuffer[i*6+1] = MixSurroundFR[i];
+				MixSoundBuffer[i*6+2] = MixSurroundC[i];
+				MixSoundBuffer[i*6+3] = MixSurroundLFE[i];
+				MixSoundBuffer[i*6+4] = MixSurroundSL[i];
+				MixSoundBuffer[i*6+5] = MixSurroundSR[i];
+			}
 		}
 
 		if(outputMonitor)
@@ -1984,6 +2004,19 @@ void CSoundFile::ProcessRamping(ModChannel &chn) const
 		}
 		const bool enableCustomRamp = (instrRampLength > 0);
 
+
+		// If starting from silence, ensure a minimum attack ramp to avoid ticks on note start.
+		if(rampUp && (chn.leftVol | chn.rightVol) == 0)
+		{
+			const int32 minStartRamp = std::max(globalRampLength, static_cast<int32>(m_MixerSettings.gdwMixingFreq / 200)); // ~5ms fallback
+			rampLength = std::max(rampLength, minStartRamp);
+			// Initialize per-note attack fade to mask sample edge clicks
+			chn.attackRampLength = chn.attackRampRemaining = static_cast<uint32>(std::max<int32>(m_MixerSettings.gdwMixingFreq / 1000, 1)); // ~1ms
+		} else if(!rampUp)
+		{
+			chn.attackRampLength = chn.attackRampRemaining = 0;
+		}
+
 		if(!rampLength)
 		{
 			rampLength = 1;
@@ -2023,6 +2056,53 @@ void CSoundFile::ProcessRamping(ModChannel &chn) const
 	}
 	chn.rampLeftVol = chn.leftVol * (1 << VOLUMERAMPPRECISION);
 	chn.rampRightVol = chn.rightVol * (1 << VOLUMERAMPPRECISION);
+	
+	// Surround channel ramping: ramp the 5 surround gains smoothly per-sample
+	chn.rampSurroundSL = chn.rampSurroundFL = chn.rampSurroundC = chn.rampSurroundFR = chn.rampSurroundSR = 0;
+	LimitMax(chn.newSurroundSL, int32_max >> VOLUMERAMPPRECISION);
+	LimitMax(chn.newSurroundFL, int32_max >> VOLUMERAMPPRECISION);
+	LimitMax(chn.newSurroundC, int32_max >> VOLUMERAMPPRECISION);
+	LimitMax(chn.newSurroundFR, int32_max >> VOLUMERAMPPRECISION);
+	LimitMax(chn.newSurroundSR, int32_max >> VOLUMERAMPPRECISION);
+	
+	if(chn.dwFlags[CHN_VOLUMERAMP] && (chn.volSurroundSL != chn.newSurroundSL || chn.volSurroundFL != chn.newSurroundFL || 
+	                                    chn.volSurroundC != chn.newSurroundC || chn.volSurroundFR != chn.newSurroundFR || 
+	                                    chn.volSurroundSR != chn.newSurroundSR))
+	{
+		// Use the same ramp length as stereo for consistency
+		int32 rampLength = (chn.nRampLength > 0) ? chn.nRampLength : 1;
+		
+		int32 slDelta = ((chn.newSurroundSL - chn.volSurroundSL) * (1 << VOLUMERAMPPRECISION));
+		int32 flDelta = ((chn.newSurroundFL - chn.volSurroundFL) * (1 << VOLUMERAMPPRECISION));
+		int32 cDelta = ((chn.newSurroundC - chn.volSurroundC) * (1 << VOLUMERAMPPRECISION));
+		int32 frDelta = ((chn.newSurroundFR - chn.volSurroundFR) * (1 << VOLUMERAMPPRECISION));
+		int32 srDelta = ((chn.newSurroundSR - chn.volSurroundSR) * (1 << VOLUMERAMPPRECISION));
+		
+		chn.rampSurroundSL = slDelta / rampLength;
+		chn.rampSurroundFL = flDelta / rampLength;
+		chn.rampSurroundC = cDelta / rampLength;
+		chn.rampSurroundFR = frDelta / rampLength;
+		chn.rampSurroundSR = srDelta / rampLength;
+		
+		chn.volSurroundSL = chn.newSurroundSL - ((chn.rampSurroundSL * rampLength) / (1 << VOLUMERAMPPRECISION));
+		chn.volSurroundFL = chn.newSurroundFL - ((chn.rampSurroundFL * rampLength) / (1 << VOLUMERAMPPRECISION));
+		chn.volSurroundC = chn.newSurroundC - ((chn.rampSurroundC * rampLength) / (1 << VOLUMERAMPPRECISION));
+		chn.volSurroundFR = chn.newSurroundFR - ((chn.rampSurroundFR * rampLength) / (1 << VOLUMERAMPPRECISION));
+		chn.volSurroundSR = chn.newSurroundSR - ((chn.rampSurroundSR * rampLength) / (1 << VOLUMERAMPPRECISION));
+	} else
+	{
+		chn.volSurroundSL = chn.newSurroundSL;
+		chn.volSurroundFL = chn.newSurroundFL;
+		chn.volSurroundC = chn.newSurroundC;
+		chn.volSurroundFR = chn.newSurroundFR;
+		chn.volSurroundSR = chn.newSurroundSR;
+	}
+	chn.rampVolSurroundSL = chn.volSurroundSL * (1 << VOLUMERAMPPRECISION);
+	chn.rampVolSurroundFL = chn.volSurroundFL * (1 << VOLUMERAMPPRECISION);
+	chn.rampVolSurroundC = chn.volSurroundC * (1 << VOLUMERAMPPRECISION);
+	chn.rampVolSurroundFR = chn.volSurroundFR * (1 << VOLUMERAMPPRECISION);
+	chn.rampVolSurroundSR = chn.volSurroundSR * (1 << VOLUMERAMPPRECISION);
+	
 	chn.dwFlags.reset(CHN_FASTVOLRAMP);
 }
 
@@ -2473,6 +2553,7 @@ bool CSoundFile::ReadNote()
 		chn.nRightVU = (chn.nRightVU > VUMETER_DECAY) ? (chn.nRightVU - VUMETER_DECAY) : 0;
 
 		chn.newLeftVol = chn.newRightVol = 0;
+		chn.newSurroundSL = chn.newSurroundFL = chn.newSurroundC = chn.newSurroundFR = chn.newSurroundSR = 0;
 		chn.pCurrentSample = (chn.pModSample && chn.pModSample->HasSampleData() && chn.nLength && chn.IsSamplePlaying()) ? chn.pModSample->samplev() : nullptr;
 		if(chn.pCurrentSample || (chn.HasMIDIOutput() && !chn.dwFlags[CHN_KEYOFF | CHN_NOTEFADE]))
 		{
@@ -2511,6 +2592,7 @@ bool CSoundFile::ReadNote()
 				if(!m_PlayConfig.getUseGlobalPreAmp())
 					realvol /= 2;
 
+				// Compute stereo panning (used for ramp length calculation even in surround mode)
 				const PanningMode panningMode = m_PlayConfig.getPanningMode();
 				if(panningMode == PanningMode::SoftPanning || (panningMode == PanningMode::Undetermined && (m_MixerSettings.MixerFlags & SNDMIX_SOFTPANNING)))
 				{
@@ -2540,7 +2622,88 @@ bool CSoundFile::ReadNote()
 					chn.newLeftVol = (realvol * (256 - pan)) / 256;
 					chn.newRightVol = (realvol * pan) / 256;
 				}
+				
+				// Compute surround panning gains (used for mixing when in surround mode)
+				if(m_MixerSettings.gnChannels >= 5)
+				{
+					if(panningMode == PanningMode::SoftPanning || (panningMode == PanningMode::Undetermined && (m_MixerSettings.MixerFlags & SNDMIX_SOFTPANNING)))
+					{
+						// Replicate stereo soft panning across 4 segments. In each segment, one speaker is held at 50% while the other fades.
+						const float position = (static_cast<float>(pan) / 256.0f) * 4.0f;
+						const int32 segment = std::min(static_cast<int32>(position), 3);
+						const float fraction = position - static_cast<float>(segment);
+
+						int32 gainA, gainB;
+						if (fraction < 0.5f)
+						{
+							gainA = 128;
+							gainB = static_cast<int32>(fraction * 2.0f * 128.0f);
+						} else
+						{
+							gainA = static_cast<int32>((1.0f - fraction) * 2.0f * 128.0f);
+							gainB = 128;
+						}
+
+						if(segment == 0) // SL -> FL
+						{
+							chn.newSurroundSL = (realvol * gainA) / 256;
+							chn.newSurroundFL = (realvol * gainB) / 256;
+						} else if(segment == 1) // FL -> C
+						{
+							chn.newSurroundFL = (realvol * gainA) / 256;
+							chn.newSurroundC  = (realvol * gainB) / 256;
+						} else if(segment == 2) // C -> FR
+						{
+							chn.newSurroundC  = (realvol * gainA) / 256;
+							chn.newSurroundFR = (realvol * gainB) / 256;
+						} else // segment == 3, FR -> SR
+						{
+							chn.newSurroundFR = (realvol * gainA) / 256;
+							chn.newSurroundSR = (realvol * gainB) / 256;
+						}
+					} else if(panningMode == PanningMode::FT2Panning)
+					{
+						LimitMax(pan, 255);
+						chn.newSurroundSL = (realvol * SurroundPanningTable_SL[pan]) / 65536;
+						chn.newSurroundFL = (realvol * SurroundPanningTable_FL[pan]) / 65536;
+						chn.newSurroundC  = (realvol * SurroundPanningTable_C [pan]) / 65536;
+						chn.newSurroundFR = (realvol * SurroundPanningTable_FR[pan]) / 65536;
+						chn.newSurroundSR = (realvol * SurroundPanningTable_SR[pan]) / 65536;
+					} else 
+					{
+						// Pan range: 0-256 (0 = SL, 256 = SR)
+						const float position = (static_cast<float>(pan) / 256.0f) * 4.0f;  // 0..4 across SL→FL→C→FR→SR
+						const int32 segment = std::min(static_cast<int32>(position), 3);   // segment 0-3
+						const float fraction = position - static_cast<float>(segment);
+
+						int32 gainSL = 0, gainFL = 0, gainC = 0, gainFR = 0, gainSR = 0;
+						if(segment == 0)
+						{
+							gainSL = static_cast<int32>((1.0f - fraction) * 256.0f);
+							gainFL = static_cast<int32>(fraction * 256.0f);
+						} else if(segment == 1)
+						{
+							gainFL = static_cast<int32>((1.0f - fraction) * 256.0f);
+							gainC = static_cast<int32>(fraction * 256.0f);
+						} else if(segment == 2)
+						{
+							gainC = static_cast<int32>((1.0f - fraction) * 256.0f);
+							gainFR = static_cast<int32>(fraction * 256.0f);
+						} else
+						{
+							gainFR = static_cast<int32>((1.0f - fraction) * 256.0f);
+							gainSR = static_cast<int32>(fraction * 256.0f);
+						}
+
+						chn.newSurroundSL = (realvol * gainSL) / 256;
+						chn.newSurroundFL = (realvol * gainFL) / 256;
+						chn.newSurroundC  = (realvol * gainC) / 256;
+						chn.newSurroundFR = (realvol * gainFR) / 256;
+						chn.newSurroundSR = (realvol * gainSR) / 256;
+					}
+				}
 			}
+			
 			// Clipping volumes
 			//if (chn.nNewRightVol > 0xFFFF) chn.nNewRightVol = 0xFFFF;
 			//if (chn.nNewLeftVol > 0xFFFF) chn.nNewLeftVol = 0xFFFF;

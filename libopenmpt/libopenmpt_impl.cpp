@@ -603,6 +603,49 @@ std::size_t module_impl::read_interleaved_wrapper( std::size_t count, std::size_
 	}
 	return count_read;
 }
+std::size_t module_impl::read_wrapper_surround( std::size_t count, float * fl, float * fr, float * c, float * lfe, float * sl, float * sr ) {
+	m_sndFile->ResetMixStat();
+	m_sndFile->m_bIsRendering = ( m_ctl_play_at_end != song_end_action::fadeout_song );
+	std::size_t count_read = 0;
+	float * const buffers[6] = { fl, fr, c, lfe, sl, sr };
+	OpenMPT::AudioTargetBufferWithGain<mpt::audio_span_planar<float>> target( mpt::audio_span_planar<float>( buffers, valid_channels( buffers, std::size( buffers ) ), count ), *m_Dithers, m_Gain );
+	while ( count > 0 ) {
+		std::size_t count_chunk = m_sndFile->Read(
+			static_cast<OpenMPT::samplecount_t>( std::min( static_cast<std::uint64_t>( count ), static_cast<std::uint64_t>( std::numeric_limits<OpenMPT::samplecount_t>::max() / 2 / 4 / 4 ) ) ),
+			target
+			);
+		if ( count_chunk == 0 ) {
+			break;
+		}
+		count -= count_chunk;
+		count_read += count_chunk;
+	}
+	if ( count_read == 0 && m_ctl_play_at_end == song_end_action::continue_song ) {
+		m_sndFile->m_PlayState.m_flags.reset(OpenMPT::SONG_ENDREACHED);
+	}
+	return count_read;
+}
+std::size_t module_impl::read_interleaved_wrapper_surround( std::size_t count, float * interleaved_surround ) {
+	m_sndFile->ResetMixStat();
+	m_sndFile->m_bIsRendering = ( m_ctl_play_at_end != song_end_action::fadeout_song );
+	std::size_t count_read = 0;
+	OpenMPT::AudioTargetBufferWithGain<mpt::audio_span_interleaved<float>> target( mpt::audio_span_interleaved<float>( interleaved_surround, 6, count ), *m_Dithers, m_Gain );
+	while ( count > 0 ) {
+		std::size_t count_chunk = m_sndFile->Read(
+			static_cast<OpenMPT::samplecount_t>( std::min( static_cast<std::uint64_t>( count ), static_cast<std::uint64_t>( std::numeric_limits<OpenMPT::samplecount_t>::max() / 2 / 4 / 4 ) ) ),
+			target
+			);
+		if ( count_chunk == 0 ) {
+			break;
+		}
+		count -= count_chunk;
+		count_read += count_chunk;
+	}
+	if ( count_read == 0 && m_ctl_play_at_end == song_end_action::continue_song ) {
+		m_sndFile->m_PlayState.m_flags.reset(OpenMPT::SONG_ENDREACHED);
+	}
+	return count_read;
+}
 
 std::vector<std::string> module_impl::get_supported_extensions() {
 	std::vector<std::string> retval;
@@ -1066,6 +1109,17 @@ std::size_t module_impl::read_interleaved_quad( std::int32_t samplerate, std::si
 	}
 	apply_mixer_settings( samplerate, 4 );
 	count = read_interleaved_wrapper( count, 4, interleaved_quad );
+	m_currentPositionSeconds += static_cast<double>( count ) / static_cast<double>( samplerate );
+	return count;
+}
+std::size_t module_impl::read_interleaved_5point1( std::int32_t samplerate, std::size_t count, float * interleaved_5point1 ) {
+	if ( !interleaved_5point1 ) {
+		throw openmpt::exception("null pointer");
+	}
+
+	// Configure mixer for 6-channel surround output, then read
+	apply_mixer_settings( samplerate, 6 );
+	count = read_interleaved_wrapper_surround( count, interleaved_5point1 );
 	m_currentPositionSeconds += static_cast<double>( count ) / static_cast<double>( samplerate );
 	return count;
 }

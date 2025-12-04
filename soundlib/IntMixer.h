@@ -41,6 +41,12 @@ using Int16MToIntS = IntToIntTraits<2, 1, mixsample_t, int16, 16>;
 using Int8SToIntS = IntToIntTraits<2, 2, mixsample_t, int8,  16>;
 using Int16SToIntS = IntToIntTraits<2, 2, mixsample_t, int16, 16>;
 
+// 5-channel surround output traits
+using Int8MToInt5 = IntToIntTraits<5, 1, mixsample_t, int8,  16>;
+using Int16MToInt5 = IntToIntTraits<5, 1, mixsample_t, int16, 16>;
+using Int8SToInt5 = IntToIntTraits<5, 2, mixsample_t, int8,  16>;
+using Int16SToInt5 = IntToIntTraits<5, 2, mixsample_t, int16, 16>;
+
 
 //////////////////////////////////////////////////////////////////////////
 // Interpolation templates
@@ -324,6 +330,154 @@ struct MixStereoRamp : public Ramp
 		rRamp += chn.rightRamp;
 		outBuffer[0] += outSample[0] * (lRamp >> VOLUMERAMPPRECISION);
 		outBuffer[1] += outSample[1] * (rRamp >> VOLUMERAMPPRECISION);
+	}
+};
+
+
+//////////////////////////////////////////////////////////////////////////
+// 5-channel surround mixing templates
+
+// Surround mix: apply 5 separate gains to mono input, output to 5 speakers
+template<class Traits>
+struct MixSurroundNoRamp
+{
+	ModChannel &channel;
+	int32 gainSL, gainFL, gainC, gainFR, gainSR;
+	uint32 attackRemain;
+	uint32 attackLen;
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE MixSurroundNoRamp(ModChannel &chn)
+		: channel{chn}
+	{
+		// Gains are pre-calculated and stored in channel (0-256 range)
+		gainSL = chn.newSurroundSL;
+		gainFL = chn.newSurroundFL;
+		gainC = chn.newSurroundC;
+		gainFR = chn.newSurroundFR;
+		gainSR = chn.newSurroundSR;
+		attackRemain = chn.attackRampRemaining;
+		attackLen = chn.attackRampLength;
+	}
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE ~MixSurroundNoRamp()
+	{
+		channel.attackRampRemaining = attackRemain;
+	}
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE void operator() (const typename Traits::outbuf_t &outSample, const ModChannel &chn, typename Traits::output_t * const MPT_RESTRICT outBuffer)
+	{
+		// Input: mono or stereo sample - fold to mono first
+		typename Traits::output_t mono = outSample[0];
+		if(Traits::numChannelsIn == 2)
+		{
+			mono = (outSample[0] + outSample[1]) / 2;
+		}
+
+		// Apply short attack fade if active (fade is 0-256)
+		if(attackRemain > 0 && attackLen > 0)
+		{
+			const uint32 progressed = attackLen - attackRemain;
+			const int32 fade = static_cast<int32>(std::min<uint32>(attackLen, progressed + 1) * 256u / attackLen);
+			mono = (mono * fade) >> 8;
+			attackRemain--;
+		}
+
+		// Apply gains directly like stereo mixer does (gains are absolute volumes from ReadNote)
+		outBuffer[0] += mono * gainSL;
+		outBuffer[1] += mono * gainFL;
+		outBuffer[2] += mono * gainC;
+		outBuffer[3] += mono * gainFR;
+		outBuffer[4] += mono * gainSR;
+	}
+};
+
+// Surround mix with volume ramping
+template<class Traits>
+struct MixSurroundRamp
+{
+	ModChannel &channel;
+	int32 lRamp, rRamp;
+	int32 slRamp, flRamp, cRamp, frRamp, srRamp;
+	int32 slVol, flVol, cVol, frVol, srVol;
+	uint32 attackRemain;
+	uint32 attackLen;
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE MixSurroundRamp(ModChannel &chn)
+		: channel{chn}
+	{
+		lRamp = chn.rampLeftVol;
+		rRamp = chn.rampRightVol;
+		slRamp = chn.rampSurroundSL;
+		flRamp = chn.rampSurroundFL;
+		cRamp = chn.rampSurroundC;
+		frRamp = chn.rampSurroundFR;
+		srRamp = chn.rampSurroundSR;
+		slVol = chn.rampVolSurroundSL;
+		flVol = chn.rampVolSurroundFL;
+		cVol = chn.rampVolSurroundC;
+		frVol = chn.rampVolSurroundFR;
+		srVol = chn.rampVolSurroundSR;
+		attackRemain = chn.attackRampRemaining;
+		attackLen = chn.attackRampLength;
+	}
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE ~MixSurroundRamp()
+	{
+		channel.rampLeftVol = lRamp; channel.leftVol = lRamp >> VOLUMERAMPPRECISION;
+		channel.rampRightVol = rRamp; channel.rightVol = rRamp >> VOLUMERAMPPRECISION;
+		channel.rampSurroundSL = slRamp; channel.volSurroundSL = slVol >> VOLUMERAMPPRECISION;
+		channel.rampSurroundFL = flRamp; channel.volSurroundFL = flVol >> VOLUMERAMPPRECISION;
+		channel.rampSurroundC = cRamp; channel.volSurroundC = cVol >> VOLUMERAMPPRECISION;
+		channel.rampSurroundFR = frRamp; channel.volSurroundFR = frVol >> VOLUMERAMPPRECISION;
+		channel.rampSurroundSR = srRamp; channel.volSurroundSR = srVol >> VOLUMERAMPPRECISION;
+		channel.rampVolSurroundSL = slVol;
+		channel.rampVolSurroundFL = flVol;
+		channel.rampVolSurroundC = cVol;
+		channel.rampVolSurroundFR = frVol;
+		channel.rampVolSurroundSR = srVol;
+		channel.attackRampRemaining = attackRemain;
+	}
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE void operator() (const typename Traits::outbuf_t &outSample, const ModChannel &chn, typename Traits::output_t * const MPT_RESTRICT outBuffer)
+	{
+		lRamp += chn.leftRamp;
+		rRamp += chn.rightRamp;
+		slVol += slRamp;
+		flVol += flRamp;
+		cVol += cRamp;
+		frVol += frRamp;
+		srVol += srRamp;
+		
+		// Input: mono or stereo sample - fold to mono first
+		typename Traits::output_t mono = outSample[0];
+		if(Traits::numChannelsIn == 2)
+		{
+			mono = (outSample[0] + outSample[1]) / 2;
+		}
+
+		// Apply short attack fade if active
+		if(attackRemain > 0 && attackLen > 0)
+		{
+			const uint32 progressed = attackLen - attackRemain;
+			const int32 fade = static_cast<int32>(std::min<uint32>(attackLen, progressed + 1) * 256u / attackLen);
+			mono = (mono * fade) >> 8;
+			attackRemain--;
+		}
+
+		// Get ramped surround gains (20.12 fixed point -> regular int)
+		// These smoothly transition from old to new values per-sample
+		const int32 gainSL = slVol >> VOLUMERAMPPRECISION;
+		const int32 gainFL = flVol >> VOLUMERAMPPRECISION;
+		const int32 gainC = cVol >> VOLUMERAMPPRECISION;
+		const int32 gainFR = frVol >> VOLUMERAMPPRECISION;
+		const int32 gainSR = srVol >> VOLUMERAMPPRECISION;
+
+		// Apply ramped gains directly (same as stereo ramp mixer does)
+		outBuffer[0] += mono * gainSL;
+		outBuffer[1] += mono * gainFL;
+		outBuffer[2] += mono * gainC;
+		outBuffer[3] += mono * gainFR;
+		outBuffer[4] += mono * gainSR;
 	}
 };
 

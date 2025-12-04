@@ -39,6 +39,11 @@ extern const uint32 FineLinearSlideDownTable[16];
 extern const uint32 LinearSlideUpTable[256];
 extern const uint32 LinearSlideDownTable[256];
 extern const uint16 XMPanningTable[256];
+extern const uint32 SurroundPanningTable_SL[256];
+extern const uint32 SurroundPanningTable_FL[256];
+extern const uint32 SurroundPanningTable_C[256];
+extern const uint32 SurroundPanningTable_FR[256];
+extern const uint32 SurroundPanningTable_SR[256];
 extern const std::array<uint8, 16> HisMastersNoiseMegaArp[16];
 
 extern const uint8 AutoVibratoIT2XM[8];

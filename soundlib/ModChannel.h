@@ -71,6 +71,16 @@ struct ModChannel
 	int32 rightRamp;             // Ditto
 	int32 rampLeftVol;           // Current ramping volume, 20.12 fixed point (see VOLUMERAMPPRECISION)
 	int32 rampRightVol;          // Ditto
+	int32 rampSurroundSL;        // Surround ramp deltas, 20.12 fixed point
+	int32 rampSurroundFL;        // Ditto
+	int32 rampSurroundC;         // Ditto
+	int32 rampSurroundFR;        // Ditto
+	int32 rampSurroundSR;        // Ditto
+	int32 rampVolSurroundSL;     // Current ramping surround volumes, 20.12 fixed point
+	int32 rampVolSurroundFL;     // Ditto
+	int32 rampVolSurroundC;      // Ditto
+	int32 rampVolSurroundFR;     // Ditto
+	int32 rampVolSurroundSR;     // Ditto
 	mixsample_t nFilter_Y[2][2]; // Filter memory - two history items per sample channel
 	mixsample_t nFilter_A0, nFilter_B0, nFilter_B1; // Filter coeffs
 	mixsample_t nFilter_HP;
@@ -92,6 +102,8 @@ struct ModChannel
 	SmpLength oldOffset;                  // Offset command memory
 	FlagSet<ChannelFlags> dwOldFlags;     // Flags from previous tick
 	int32 newLeftVol, newRightVol;
+	int32 newSurroundFL, newSurroundFR, newSurroundC, newSurroundSL, newSurroundSR; // 5.1 surround gains (computed per tick)
+	int32 volSurroundSL, volSurroundFL, volSurroundC, volSurroundFR, volSurroundSR;  // Current surround volumes for ramping
 	int32 nRealVolume, nRealPan;
 	int32 nVolume, nPan, nFadeOutVol;
 	int32 nPeriod;  // Frequency in Hz if CSoundFile::PeriodsAreFrequencies() or using custom tuning, 4x Amiga periods otherwise
@@ -103,6 +115,8 @@ struct ModChannel
 	uint32 nEFxOffset;  // Offset memory for Invert Loop (EFx, .MOD only)
 	ROWINDEX nPatternLoop;
 	AutoSlideStatus autoSlide;
+	uint32 attackRampLength = 0;      // Attack fade length in samples
+	uint32 attackRampRemaining = 0;   // Remaining samples in attack fade
 	uint16 portamentoSlide;
 	int16 nFineTune;
 	int16 microTuning;  // Micro-tuning / MIDI pitch wheel command

@@ -1140,6 +1140,19 @@ LIBOPENMPT_API size_t openmpt_module_read_interleaved_float_stereo( openmpt_modu
  * \sa \ref libopenmpt_c_outputformat
 */
 LIBOPENMPT_API size_t openmpt_module_read_interleaved_float_quad(   openmpt_module * mod, int32_t samplerate, size_t count, float * interleaved_quad   );
+/*! \brief Render 5.1 surround audio data
+ *
+ * \param mod The module handle to work on.
+ * \param samplerate Sample rate to render output. Should be in [8000,192000], but this is not enforced.
+ * \param count Number of audio frames to render per channel.
+ * \param interleaved_5point1 Pointer to a buffer of at least count*6 elements that receives the interleaved 5.1 output in the order (FL,FR,C,LFE,SL,SR).
+ * \return The number of frames actually rendered.
+ * \retval 0 The end of song has been reached.
+ * \remarks The output buffers are only written to up to the returned number of elements.
+ * \remarks Floating point samples are in the [-1.0..1.0] nominal range. They are not clipped to that range though and thus might overshoot.
+ * \sa \ref libopenmpt_c_outputformat
+ */
+LIBOPENMPT_API size_t openmpt_module_read_interleaved_float_5point1( openmpt_module * mod, int32_t samplerate, size_t count, float * interleaved_5point1 );
 /*@}*/
 
 /*! \brief Get the list of supported metadata item keys

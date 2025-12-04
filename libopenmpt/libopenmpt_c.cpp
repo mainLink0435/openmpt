@@ -943,6 +943,15 @@ size_t openmpt_module_read_interleaved_float_quad( openmpt_module * mod, int32_t
 	}
 	return 0;
 }
+size_t openmpt_module_read_interleaved_float_5point1( openmpt_module * mod, int32_t samplerate, size_t count, float * interleaved_5point1 ) {
+	try {
+		openmpt::interface::check_soundfile( mod );
+		return mod->impl->read_interleaved_5point1( samplerate, count, interleaved_5point1 );
+	} catch ( ... ) {
+		openmpt::report_exception( __func__, mod );
+	}
+	return 0;
+}
 
 const char * openmpt_module_get_metadata_keys( openmpt_module * mod ) {
 	try {

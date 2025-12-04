@@ -20,6 +20,11 @@
 #include "Sndfile.h"
 #include "MixerLoops.h"
 #include "MixFuncTable.h"
+#ifdef MPT_INTMIXER
+#include "IntMixer.h"
+#else
+#include "FloatMixer.h"
+#endif
 #include "plugins/PlugInterface.h"
 #include <cfloat>  // For FLT_EPSILON
 #include <algorithm>
@@ -313,6 +318,37 @@ void CSoundFile::CreateStereoMix(int count)
 	m_nMixStat = std::max(m_nMixStat, numChannelsMixed);
 }
 
+void CSoundFile::CreateSurroundMix(int count)
+{
+	if(!count)
+		return;
+
+	// Reset surround buffers
+	std::fill(MixSurroundFL, MixSurroundFL + count, 0);
+	std::fill(MixSurroundFR, MixSurroundFR + count, 0);
+	std::fill(MixSurroundC, MixSurroundC + count, 0);
+	std::fill(MixSurroundLFE, MixSurroundLFE + count, 0);
+	std::fill(MixSurroundSL, MixSurroundSL + count, 0);
+	std::fill(MixSurroundSR, MixSurroundSR + count, 0);
+
+	// Mix channels using independent surround mixer (not stereo path)
+	// Surround mixer routes directly to 6 separate buffers
+	// Currently: distributes mono equally to all 5 speakers, LFE silent
+
+	// Channels that are actually mixed and not skipped (because they are paused or muted)
+	CHANNELINDEX numChannelsMixed = 0;
+
+	for(uint32 nChn = 0; nChn < m_nMixChannels; nChn++)
+	{
+		if(MixChannelSurround(count, m_PlayState.Chn[m_PlayState.ChnMix[nChn]], m_PlayState.ChnMix[nChn], numChannelsMixed < m_MixerSettings.m_nMaxMixChannels))
+			numChannelsMixed++;
+	}
+	m_nMixStat = std::max(m_nMixStat, numChannelsMixed);
+
+	// Generate LFE channel: sum 5 main channels, lowpass at 120Hz, apply -10dB attenuation
+	ProcessLFEChannel(count);
+}
+
 
 std::pair<mixsample_t *, mixsample_t *> CSoundFile::GetChannelOffsets(const ModChannel &chn, CHANNELINDEX channel)
 {
@@ -549,6 +585,421 @@ bool CSoundFile::MixChannel(int count, ModChannel &chn, CHANNELINDEX channel, bo
 		return addToMix;
 	}
 	return false;
+}
+
+
+// Surround mixer: separate from stereo path, routes to 6 independent channels
+// No offset tracking, no reverb routing, direct buffer accumulation
+bool CSoundFile::MixChannelSurround(int count, ModChannel &chn, CHANNELINDEX channel, bool doMix)
+{
+	if(chn.pCurrentSample || chn.nLOfs || chn.nROfs)
+	{
+		// Surround mixer does not use reverb, plugin, or surround flag routing
+		// All samples accumulate directly to surround buffers
+
+		// Look for plugins associated with this implicit tracker channel.
+		// Note: surround mixer currently skips plugin buffer handling.
+
+		if(chn.isPaused)
+		{
+			// Surround: no offset tracking, no cleanup needed
+			chn.nROfs = chn.nLOfs = 0;
+			return false;
+		}
+
+		MixLoopState mixLoopState(*this, chn);
+
+		////////////////////////////////////////////////////
+		bool addToMix = false;
+		int nsamples = count;
+		
+		int surrBufOffset = 0;  // Current position in surround buffers
+		
+		// Keep mixing this sample until the buffer is filled.
+		do
+		{
+			uint32 nrampsamples = nsamples;
+			int32 nSmpCount;
+			if(chn.nRampLength > 0)
+			{
+				if (nrampsamples > chn.nRampLength) nrampsamples = chn.nRampLength;
+			}
+
+			if((nSmpCount = mixLoopState.GetSampleCount(chn, nrampsamples)) <= 0)
+			{
+				// Stopping the channel
+				chn.pCurrentSample = nullptr;
+				chn.nLength = 0;
+				chn.position.Set(0);
+				chn.nRampLength = 0;
+				// Surround: no EndChannelOfs needed
+				chn.nROfs = chn.nLOfs = 0;
+				chn.dwFlags.reset(CHN_PINGPONGFLAG);
+				break;
+			}
+
+			// Should we mix this channel?
+			if(!doMix                                                   // Too many channels
+			   || (!chn.nRampLength && !(chn.leftVol | chn.rightVol)))  // Channel is completely silent
+			{
+				chn.position += chn.increment * nSmpCount;
+				chn.nROfs = chn.nLOfs = 0;
+				// Surround: advance buffer offset even when skipping (critical for buffer alignment)
+				surrBufOffset += nSmpCount;
+				addToMix = false;
+			}
+#ifdef MODPLUG_TRACKER
+			else if(m_SamplePlayLengths != nullptr)
+			{
+				// Detecting the longest play time for each sample for optimization
+				SmpLength pos = chn.position.GetUInt();
+				chn.position += chn.increment * nSmpCount;
+				if(!chn.increment.IsNegative())
+				{
+					pos = chn.position.GetUInt();
+				}
+				size_t smp = std::distance(static_cast<const ModSample*>(static_cast<std::decay<decltype(Samples)>::type>(Samples)), chn.pModSample);
+				if(smp < m_SamplePlayLengths->size())
+				{
+					(*m_SamplePlayLengths)[smp] = std::max((*m_SamplePlayLengths)[smp], pos);
+				}
+			}
+#endif
+			else
+			{
+				// Surround panning gains are computed in Sndmix.cpp during the panning setup phase
+				// The mixer will apply chn.newSurroundSL/FL/C/FR/SR per-sample
+
+				// Prepare interleaved 5-channel buffer (SL, FL, C, FR, SR)
+				mixsample_t surround5Buffer[MIXBUFFERSIZE * 5];
+				std::fill(surround5Buffer, surround5Buffer + (nSmpCount * 5), mixsample_t(0));
+
+#ifdef MPT_BUILD_DEBUG
+				SamplePosition targetpos = chn.position + chn.increment * nSmpCount;
+#endif
+
+				const ResamplingMode resamplingMode = static_cast<ResamplingMode>(chn.resamplingMode);
+				const bool is16Bit = chn.dwFlags[CHN_16BIT];
+				const bool isStereo = chn.dwFlags[CHN_STEREO];
+				const bool ramp = chn.nRampLength != 0;
+
+				if(resamplingMode == SRCMODE_NEAREST)
+				{
+					if(!is16Bit && !isStereo)
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int8MToInt5, NoInterpolation<Int8MToInt5>, NoFilter<Int8MToInt5>, MixSurroundRamp<Int8MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8MToInt5, NoInterpolation<Int8MToInt5>, NoFilter<Int8MToInt5>, MixSurroundNoRamp<Int8MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int8MToFloat5, NoInterpolation<Int8MToFloat5>, NoFilter<Int8MToFloat5>, MixSurroundRamp<Int8MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8MToFloat5, NoInterpolation<Int8MToFloat5>, NoFilter<Int8MToFloat5>, MixSurroundNoRamp<Int8MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+					else if(is16Bit && !isStereo)
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int16MToInt5, NoInterpolation<Int16MToInt5>, NoFilter<Int16MToInt5>, MixSurroundRamp<Int16MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16MToInt5, NoInterpolation<Int16MToInt5>, NoFilter<Int16MToInt5>, MixSurroundNoRamp<Int16MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int16MToFloat5, NoInterpolation<Int16MToFloat5>, NoFilter<Int16MToFloat5>, MixSurroundRamp<Int16MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16MToFloat5, NoInterpolation<Int16MToFloat5>, NoFilter<Int16MToFloat5>, MixSurroundNoRamp<Int16MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+					else if(!is16Bit && isStereo)
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int8SToInt5, NoInterpolation<Int8SToInt5>, NoFilter<Int8SToInt5>, MixSurroundRamp<Int8SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8SToInt5, NoInterpolation<Int8SToInt5>, NoFilter<Int8SToInt5>, MixSurroundNoRamp<Int8SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int8SToFloat5, NoInterpolation<Int8SToFloat5>, NoFilter<Int8SToFloat5>, MixSurroundRamp<Int8SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8SToFloat5, NoInterpolation<Int8SToFloat5>, NoFilter<Int8SToFloat5>, MixSurroundNoRamp<Int8SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+					else
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int16SToInt5, NoInterpolation<Int16SToInt5>, NoFilter<Int16SToInt5>, MixSurroundRamp<Int16SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16SToInt5, NoInterpolation<Int16SToInt5>, NoFilter<Int16SToInt5>, MixSurroundNoRamp<Int16SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int16SToFloat5, NoInterpolation<Int16SToFloat5>, NoFilter<Int16SToFloat5>, MixSurroundRamp<Int16SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16SToFloat5, NoInterpolation<Int16SToFloat5>, NoFilter<Int16SToFloat5>, MixSurroundNoRamp<Int16SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+				}
+				else if(resamplingMode == SRCMODE_LINEAR)
+				{
+					if(!is16Bit && !isStereo)
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int8MToInt5, LinearInterpolation<Int8MToInt5>, NoFilter<Int8MToInt5>, MixSurroundRamp<Int8MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8MToInt5, LinearInterpolation<Int8MToInt5>, NoFilter<Int8MToInt5>, MixSurroundNoRamp<Int8MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int8MToFloat5, LinearInterpolation<Int8MToFloat5>, NoFilter<Int8MToFloat5>, MixSurroundRamp<Int8MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8MToFloat5, LinearInterpolation<Int8MToFloat5>, NoFilter<Int8MToFloat5>, MixSurroundNoRamp<Int8MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+					else if(is16Bit && !isStereo)
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int16MToInt5, LinearInterpolation<Int16MToInt5>, NoFilter<Int16MToInt5>, MixSurroundRamp<Int16MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16MToInt5, LinearInterpolation<Int16MToInt5>, NoFilter<Int16MToInt5>, MixSurroundNoRamp<Int16MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int16MToFloat5, LinearInterpolation<Int16MToFloat5>, NoFilter<Int16MToFloat5>, MixSurroundRamp<Int16MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16MToFloat5, LinearInterpolation<Int16MToFloat5>, NoFilter<Int16MToFloat5>, MixSurroundNoRamp<Int16MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+					else if(!is16Bit && isStereo)
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int8SToInt5, LinearInterpolation<Int8SToInt5>, NoFilter<Int8SToInt5>, MixSurroundRamp<Int8SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8SToInt5, LinearInterpolation<Int8SToInt5>, NoFilter<Int8SToInt5>, MixSurroundNoRamp<Int8SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int8SToFloat5, LinearInterpolation<Int8SToFloat5>, NoFilter<Int8SToFloat5>, MixSurroundRamp<Int8SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8SToFloat5, LinearInterpolation<Int8SToFloat5>, NoFilter<Int8SToFloat5>, MixSurroundNoRamp<Int8SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+					else
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int16SToInt5, LinearInterpolation<Int16SToInt5>, NoFilter<Int16SToInt5>, MixSurroundRamp<Int16SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16SToInt5, LinearInterpolation<Int16SToInt5>, NoFilter<Int16SToInt5>, MixSurroundNoRamp<Int16SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int16SToFloat5, LinearInterpolation<Int16SToFloat5>, NoFilter<Int16SToFloat5>, MixSurroundRamp<Int16SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16SToFloat5, LinearInterpolation<Int16SToFloat5>, NoFilter<Int16SToFloat5>, MixSurroundNoRamp<Int16SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+				}
+				else
+				{
+					// Default to linear for other modes (TODO: add cubic/sinc support)
+					if(!is16Bit && !isStereo)
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int8MToInt5, LinearInterpolation<Int8MToInt5>, NoFilter<Int8MToInt5>, MixSurroundRamp<Int8MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8MToInt5, LinearInterpolation<Int8MToInt5>, NoFilter<Int8MToInt5>, MixSurroundNoRamp<Int8MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int8MToFloat5, LinearInterpolation<Int8MToFloat5>, NoFilter<Int8MToFloat5>, MixSurroundRamp<Int8MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8MToFloat5, LinearInterpolation<Int8MToFloat5>, NoFilter<Int8MToFloat5>, MixSurroundNoRamp<Int8MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+					else if(is16Bit && !isStereo)
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int16MToInt5, LinearInterpolation<Int16MToInt5>, NoFilter<Int16MToInt5>, MixSurroundRamp<Int16MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16MToInt5, LinearInterpolation<Int16MToInt5>, NoFilter<Int16MToInt5>, MixSurroundNoRamp<Int16MToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int16MToFloat5, LinearInterpolation<Int16MToFloat5>, NoFilter<Int16MToFloat5>, MixSurroundRamp<Int16MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16MToFloat5, LinearInterpolation<Int16MToFloat5>, NoFilter<Int16MToFloat5>, MixSurroundNoRamp<Int16MToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+					else if(!is16Bit && isStereo)
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int8SToInt5, LinearInterpolation<Int8SToInt5>, NoFilter<Int8SToInt5>, MixSurroundRamp<Int8SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8SToInt5, LinearInterpolation<Int8SToInt5>, NoFilter<Int8SToInt5>, MixSurroundNoRamp<Int8SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int8SToFloat5, LinearInterpolation<Int8SToFloat5>, NoFilter<Int8SToFloat5>, MixSurroundRamp<Int8SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int8SToFloat5, LinearInterpolation<Int8SToFloat5>, NoFilter<Int8SToFloat5>, MixSurroundNoRamp<Int8SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+					else
+#ifdef MPT_INTMIXER
+						if(ramp)
+							SampleLoop<Int16SToInt5, LinearInterpolation<Int16SToInt5>, NoFilter<Int16SToInt5>, MixSurroundRamp<Int16SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16SToInt5, LinearInterpolation<Int16SToInt5>, NoFilter<Int16SToInt5>, MixSurroundNoRamp<Int16SToInt5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#else
+						if(ramp)
+							SampleLoop<Int16SToFloat5, LinearInterpolation<Int16SToFloat5>, NoFilter<Int16SToFloat5>, MixSurroundRamp<Int16SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+						else
+							SampleLoop<Int16SToFloat5, LinearInterpolation<Int16SToFloat5>, NoFilter<Int16SToFloat5>, MixSurroundNoRamp<Int16SToFloat5>>(chn, m_Resampler, surround5Buffer, nSmpCount);
+#endif
+				}
+
+#ifdef MPT_BUILD_DEBUG
+				MPT_ASSERT(chn.position.GetUInt() == targetpos.GetUInt());
+#endif
+
+				// Deinterleave surround buffer into speaker accumulators
+				for(int32 i = 0; i < nSmpCount; i++)
+				{
+					MixSurroundSL[surrBufOffset + i] += surround5Buffer[i * 5 + 0];
+					MixSurroundFL[surrBufOffset + i] += surround5Buffer[i * 5 + 1];
+					MixSurroundC [surrBufOffset + i] += surround5Buffer[i * 5 + 2];
+					MixSurroundFR[surrBufOffset + i] += surround5Buffer[i * 5 + 3];
+					MixSurroundSR[surrBufOffset + i] += surround5Buffer[i * 5 + 4];
+				}
+				surrBufOffset += nSmpCount;
+				addToMix = true;
+			}
+
+			nsamples -= nSmpCount;
+			if (chn.nRampLength)
+			{
+				if (chn.nRampLength <= static_cast<uint32>(nSmpCount))
+				{
+					// Ramping is done
+					chn.nRampLength = 0;
+					chn.leftVol = chn.newLeftVol;
+					chn.rightVol = chn.newRightVol;
+					chn.rightRamp = chn.leftRamp = 0;
+					if(chn.dwFlags[CHN_NOTEFADE] && !chn.nFadeOutVol)
+					{
+						chn.nLength = 0;
+						chn.pCurrentSample = nullptr;
+					}
+				} else
+				{
+					chn.nRampLength -= nSmpCount;
+				}
+			}
+
+			const bool pastLoopEnd = chn.position.GetUInt() >= chn.nLoopEnd && chn.dwFlags[CHN_LOOP];
+			const bool pastSampleEnd = chn.position.GetUInt() >= chn.nLength && !chn.dwFlags[CHN_LOOP] && chn.nLength && !chn.nMasterChn;
+			const bool doSampleSwap = m_playBehaviour[kMODSampleSwap] && chn.swapSampleIndex && chn.swapSampleIndex <= GetNumSamples() && chn.pModSample != &Samples[chn.swapSampleIndex];
+			if((pastLoopEnd || pastSampleEnd) && doSampleSwap)
+			{
+				// ProTracker compatibility: Instrument changes without a note do not happen instantly, but rather when the sample loop has finished playing.
+				// Test case: PTInstrSwap.mod, PTSwapNoLoop.mod
+#ifdef MODPLUG_TRACKER
+				if(m_SamplePlayLengths != nullptr)
+				{
+					// Even if the sample was playing at zero volume, we need to retain its full length for correct sample swap timing
+					size_t smp = std::distance(static_cast<const ModSample *>(static_cast<std::decay<decltype(Samples)>::type>(Samples)), chn.pModSample);
+					if(smp < m_SamplePlayLengths->size())
+					{
+						(*m_SamplePlayLengths)[smp] = std::max((*m_SamplePlayLengths)[smp], std::min(chn.nLength, chn.position.GetUInt()));
+					}
+				}
+#endif
+				const ModSample &smp = Samples[chn.swapSampleIndex];
+				chn.pModSample = &smp;
+				chn.pCurrentSample = smp.samplev();
+				chn.dwFlags = (chn.dwFlags & CHN_CHANNELFLAGS) | smp.uFlags;
+				if(smp.uFlags[CHN_LOOP])
+					chn.nLength = smp.nLoopEnd;
+				else if(!m_playBehaviour[kMODOneShotLoops])
+					chn.nLength = smp.nLength;
+				else
+					chn.nLength = 0; // non-looping sample continue in oneshot mode (i.e. they will most probably just play silence)
+				chn.nLoopStart = smp.nLoopStart;
+				chn.nLoopEnd = smp.nLoopEnd;
+				chn.position.SetInt(chn.nLoopStart);
+				chn.swapSampleIndex = 0;
+				mixLoopState.UpdateLookaheadPointers(chn);
+				if(!chn.pCurrentSample)
+					break;
+			} else if(pastLoopEnd && !doSampleSwap && m_playBehaviour[kMODOneShotLoops] && chn.nLoopStart == 0)
+			{
+				// ProTracker "oneshot" loops (if loop start is 0, play the whole sample once and then repeat until loop end)
+				chn.position.SetInt(0);
+				chn.nLoopEnd = chn.nLength = chn.pModSample->nLoopEnd;
+			}
+		} while(nsamples > 0);
+
+		// Restore sample pointer in case it got changed through loop wrap-around
+		chn.pCurrentSample = mixLoopState.samplePointer;
+	
+		// Surround: no plugin reset needed (plugins not supported yet)
+		return addToMix;
+	}
+	return false;
+}
+
+
+// Initialize LFE lowpass filter coefficients for 2nd-order Butterworth at 120Hz
+void CSoundFile::InitializeLFEFilter()
+{
+	const uint32 sampleRate = m_MixerSettings.gdwMixingFreq;
+	
+	// Only recalculate if sample rate changed
+	if(m_lfeFilterSampleRate == sampleRate && sampleRate > 0)
+		return;
+	
+	m_lfeFilterSampleRate = sampleRate;
+	
+	// Reset filter state
+	m_lfeFilterX1 = m_lfeFilterX2 = 0.0;
+	m_lfeFilterY1 = m_lfeFilterY2 = 0.0;
+	
+	if(sampleRate == 0)
+		return;
+	
+	// 2nd-order Butterworth lowpass at 120Hz
+	// Using bilinear transform (Cookbook formulae by Robert Bristow-Johnson)
+	const double cutoffFreq = 120.0;
+	const double omega = 2.0 * 3.14159265358979323846 * cutoffFreq / static_cast<double>(sampleRate);
+	const double sinOmega = std::sin(omega);
+	const double cosOmega = std::cos(omega);
+	const double alpha = sinOmega / (2.0 * 0.7071067811865476);  // Q = 1/sqrt(2) for Butterworth
+	
+	// Coefficients (normalized)
+	const double a0 = 1.0 + alpha;
+	m_lfeFilterB0 = ((1.0 - cosOmega) / 2.0) / a0;
+	m_lfeFilterB1 = (1.0 - cosOmega) / a0;
+	m_lfeFilterB2 = ((1.0 - cosOmega) / 2.0) / a0;
+	m_lfeFilterA1 = (-2.0 * cosOmega) / a0;
+	m_lfeFilterA2 = (1.0 - alpha) / a0;
+}
+
+
+// Process LFE channel: sum 5 main channels, lowpass at 120Hz, apply -10dB attenuation
+void CSoundFile::ProcessLFEChannel(int count)
+{
+	// Initialize filter if needed
+	InitializeLFEFilter();
+	
+	// LFE gain: -10dB = 10^(-10/20) ≈ 0.3162
+	constexpr double lfeGain = 0.31622776601683794;
+	
+	for(int i = 0; i < count; i++)
+	{
+		// Sum all 5 main channels
+		double sum = static_cast<double>(MixSurroundFL[i]) 
+		           + static_cast<double>(MixSurroundFR[i])
+		           + static_cast<double>(MixSurroundC[i])
+		           + static_cast<double>(MixSurroundSL[i])
+		           + static_cast<double>(MixSurroundSR[i]);
+		
+		// Apply 2nd-order IIR lowpass filter (Direct Form II Transposed)
+		// y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+		const double output = m_lfeFilterB0 * sum 
+		                    + m_lfeFilterB1 * m_lfeFilterX1 
+		                    + m_lfeFilterB2 * m_lfeFilterX2
+		                    - m_lfeFilterA1 * m_lfeFilterY1
+		                    - m_lfeFilterA2 * m_lfeFilterY2;
+		
+		// Update filter state
+		m_lfeFilterX2 = m_lfeFilterX1;
+		m_lfeFilterX1 = sum;
+		m_lfeFilterY2 = m_lfeFilterY1;
+		m_lfeFilterY1 = output;
+		
+		// Apply -10dB gain and store to LFE buffer
+		MixSurroundLFE[i] = static_cast<mixsample_t>(output * lfeGain);
+	}
 }
 
 

@@ -76,6 +76,7 @@ void ModChannel::Reset(ResetFlags resetMask, const CSoundFile &sndFile, CHANNELI
 		nFilterMode = FilterMode::LowPass;
 		rightVol = leftVol = 0;
 		newRightVol = newLeftVol = 0;
+		newSurroundFL = newSurroundFR = newSurroundC = newSurroundSL = newSurroundSR = 0;
 		rightRamp = leftRamp = 0;
 		nVolume = 0;  // Needs to be 0 for SMP_NODEFAULTVOLUME flag
 		nVibratoPos = nTremoloPos = nPanbrelloPos = 0;

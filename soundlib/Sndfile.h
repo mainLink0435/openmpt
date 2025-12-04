@@ -437,6 +437,13 @@ private:
 	// Interleaved Front Mix Buffer (Also room for interleaved rear mix)
 	mixsample_t MixSoundBuffer[MIXBUFFERSIZE * 4];
 	mixsample_t MixRearBuffer[MIXBUFFERSIZE * 2];
+	// 5.1 Surround Mix Buffers (separate from stereo/quad)
+	mixsample_t MixSurroundFL[MIXBUFFERSIZE];
+	mixsample_t MixSurroundFR[MIXBUFFERSIZE];
+	mixsample_t MixSurroundC[MIXBUFFERSIZE];
+	mixsample_t MixSurroundLFE[MIXBUFFERSIZE];
+	mixsample_t MixSurroundSL[MIXBUFFERSIZE];
+	mixsample_t MixSurroundSR[MIXBUFFERSIZE];
 	// Non-interleaved plugin processing buffer
 	float MixFloatBuffer[2][MIXBUFFERSIZE];
 	mixsample_t MixInputBuffer[NUMMIXINPUTBUFFERS][MIXBUFFERSIZE];
@@ -444,6 +451,17 @@ private:
 	// End-of-sample pop reduction tail level
 	mixsample_t m_dryLOfsVol = 0, m_dryROfsVol = 0;
 	mixsample_t m_surroundLOfsVol = 0, m_surroundROfsVol = 0;
+	// 5.1 Surround offset volumes
+	mixsample_t m_surroundFLOfsVol = 0, m_surroundFROfsVol = 0;
+	mixsample_t m_surroundCOfsVol = 0, m_surroundLFEOfsVol = 0;
+	mixsample_t m_surroundSLOfsVol = 0, m_surroundSROfsVol = 0;
+
+	// LFE lowpass filter state (120Hz 2nd-order Butterworth)
+	double m_lfeFilterX1 = 0.0, m_lfeFilterX2 = 0.0;  // Input history
+	double m_lfeFilterY1 = 0.0, m_lfeFilterY2 = 0.0;  // Output history
+	double m_lfeFilterB0 = 0.0, m_lfeFilterB1 = 0.0, m_lfeFilterB2 = 0.0;  // Numerator coefficients
+	double m_lfeFilterA1 = 0.0, m_lfeFilterA2 = 0.0;  // Denominator coefficients
+	uint32 m_lfeFilterSampleRate = 0;  // Sample rate for which coefficients were calculated
 
 public:
 	MixerSettings m_MixerSettings;
@@ -982,7 +1000,11 @@ public:
 	samplecount_t ReadOneTick();
 private:
 	void CreateStereoMix(int count);
+	void CreateSurroundMix(int count);
 	bool MixChannel(int count, ModChannel &chn, CHANNELINDEX channel, bool doMix);
+	bool MixChannelSurround(int count, ModChannel &chn, CHANNELINDEX channel, bool doMix);
+	void ProcessLFEChannel(int count);
+	void InitializeLFEFilter();
 	std::pair<mixsample_t *, mixsample_t *> GetChannelOffsets(const ModChannel &chn, CHANNELINDEX channel);
 public:
 	bool FadeSong(uint32 msec);

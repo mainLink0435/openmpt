@@ -168,6 +168,8 @@ protected:
 	std::size_t read_wrapper( std::size_t count, float * left, float * right, float * rear_left, float * rear_right );
 	std::size_t read_interleaved_wrapper( std::size_t count, std::size_t channels, std::int16_t * interleaved );
 	std::size_t read_interleaved_wrapper( std::size_t count, std::size_t channels, float * interleaved );
+	std::size_t read_wrapper_surround( std::size_t count, float * fl, float * fr, float * c, float * lfe, float * sl, float * sr );
+	std::size_t read_interleaved_wrapper_surround( std::size_t count, float * interleaved_surround );
 	std::string get_message_instruments() const;
 	std::string get_message_samples() const;
 	std::pair< std::string, std::string > format_and_highlight_pattern_row_channel_command( std::int32_t p, std::int32_t r, std::int32_t c, int command ) const;
@@ -223,6 +225,7 @@ public:
 	std::size_t read_interleaved_quad( std::int32_t samplerate, std::size_t count, std::int16_t * interleaved_quad );
 	std::size_t read_interleaved_stereo( std::int32_t samplerate, std::size_t count, float * interleaved_stereo );
 	std::size_t read_interleaved_quad( std::int32_t samplerate, std::size_t count, float * interleaved_quad );
+	std::size_t read_interleaved_5point1( std::int32_t samplerate, std::size_t count, float * interleaved_5point1 );
 	std::vector<std::string> get_metadata_keys() const;
 	std::string get_metadata( const std::string & key ) const;
 	double get_current_estimated_bpm() const;

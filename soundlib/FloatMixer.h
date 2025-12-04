@@ -34,6 +34,12 @@ using Int16MToFloatS = IntToFloatTraits<2, 1, mixsample_t, int16, -int16_min>;
 using Int8SToFloatS = IntToFloatTraits<2, 2, mixsample_t, int8,  -int8_min>;
 using Int16SToFloatS  = IntToFloatTraits<2, 2, mixsample_t, int16, -int16_min>;
 
+// 5-channel surround output traits
+using Int8MToFloat5 = IntToFloatTraits<5, 1, mixsample_t, int8,  -int8_min>;
+using Int16MToFloat5 = IntToFloatTraits<5, 1, mixsample_t, int16, -int16_min>;
+using Int8SToFloat5 = IntToFloatTraits<5, 2, mixsample_t, int8,  -int8_min>;
+using Int16SToFloat5  = IntToFloatTraits<5, 2, mixsample_t, int16, -int16_min>;
+
 
 //////////////////////////////////////////////////////////////////////////
 // Interpolation templates
@@ -241,6 +247,145 @@ struct MixStereoRamp : public Ramp
 		rRamp += chn.rightRamp;
 		outBuffer[0] += outSample[0] * (lRamp >> VOLUMERAMPPRECISION) * (1.0f / 4096.0f);
 		outBuffer[1] += outSample[1] * (rRamp >> VOLUMERAMPPRECISION) * (1.0f / 4096.0f);
+	}
+};
+
+
+//////////////////////////////////////////////////////////////////////////
+// 5-channel surround mixing templates
+
+// Surround mix: apply 5 separate gains to mono input, output to 5 speakers
+template<class Traits>
+struct MixSurroundNoRamp
+{
+	ModChannel &channel;
+	float gainSL, gainFL, gainC, gainFR, gainSR;
+	uint32 attackRemain;
+	uint32 attackLen;
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE MixSurroundNoRamp(ModChannel &chn)
+		: channel{chn}
+	{
+		// Gains are pre-calculated and stored in channel (0-256 range)
+		gainSL = static_cast<float>(chn.newSurroundSL) * (1.0f / 256.0f);
+		gainFL = static_cast<float>(chn.newSurroundFL) * (1.0f / 256.0f);
+		gainC = static_cast<float>(chn.newSurroundC) * (1.0f / 256.0f);
+		gainFR = static_cast<float>(chn.newSurroundFR) * (1.0f / 256.0f);
+		gainSR = static_cast<float>(chn.newSurroundSR) * (1.0f / 256.0f);
+		attackRemain = chn.attackRampRemaining;
+		attackLen = chn.attackRampLength;
+	}
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE ~MixSurroundNoRamp()
+	{
+		channel.attackRampRemaining = attackRemain;
+	}
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE void operator() (const typename Traits::outbuf_t &outSample, const ModChannel &chn, typename Traits::output_t * const outBuffer)
+	{
+		// Input: mono or stereo sample - fold to mono first
+		typename Traits::output_t mono = outSample[0];
+		if(Traits::numChannelsIn == 2)
+		{
+			mono = (outSample[0] + outSample[1]) * 0.5f;
+		}
+
+		// Apply attack fade if active
+		if(attackRemain > 0 && attackLen > 0)
+		{
+			const uint32 progressed = attackLen - attackRemain;
+			const float fade = static_cast<float>(std::min<uint32>(attackLen, progressed + 1)) / static_cast<float>(attackLen);
+			mono *= fade;
+			attackRemain--;
+		}
+
+		// The gains are converted to 0-1 range and already include volume from ReadNote()
+		// Apply them directly to distribute mono to 5 speakers
+		outBuffer[0] += mono * gainSL;
+		outBuffer[1] += mono * gainFL;
+		outBuffer[2] += mono * gainC;
+		outBuffer[3] += mono * gainFR;
+		outBuffer[4] += mono * gainSR;
+	}
+};
+
+
+// Surround mix with volume ramping
+template<class Traits>
+struct MixSurroundRamp : public Ramp
+{
+	float slVol, flVol, cVol, frVol, srVol;
+	float slRamp, flRamp, cRamp, frRamp, srRamp;
+	uint32 attackRemain;
+	uint32 attackLen;
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE MixSurroundRamp(ModChannel &chn)
+		: Ramp(chn)
+	{
+		slVol = static_cast<float>(chn.rampVolSurroundSL) * (1.0f / 4096.0f);
+		flVol = static_cast<float>(chn.rampVolSurroundFL) * (1.0f / 4096.0f);
+		cVol = static_cast<float>(chn.rampVolSurroundC) * (1.0f / 4096.0f);
+		frVol = static_cast<float>(chn.rampVolSurroundFR) * (1.0f / 4096.0f);
+		srVol = static_cast<float>(chn.rampVolSurroundSR) * (1.0f / 4096.0f);
+		
+		slRamp = static_cast<float>(chn.rampSurroundSL) * (1.0f / 4096.0f);
+		flRamp = static_cast<float>(chn.rampSurroundFL) * (1.0f / 4096.0f);
+		cRamp = static_cast<float>(chn.rampSurroundC) * (1.0f / 4096.0f);
+		frRamp = static_cast<float>(chn.rampSurroundFR) * (1.0f / 4096.0f);
+		srRamp = static_cast<float>(chn.rampSurroundSR) * (1.0f / 4096.0f);
+		
+		attackRemain = chn.attackRampRemaining;
+		attackLen = chn.attackRampLength;
+	}
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE ~MixSurroundRamp()
+	{
+		channel.volSurroundSL = static_cast<int32>(slVol * 4096.0f + 0.5f);
+		channel.volSurroundFL = static_cast<int32>(flVol * 4096.0f + 0.5f);
+		channel.volSurroundC = static_cast<int32>(cVol * 4096.0f + 0.5f);
+		channel.volSurroundFR = static_cast<int32>(frVol * 4096.0f + 0.5f);
+		channel.volSurroundSR = static_cast<int32>(srVol * 4096.0f + 0.5f);
+		channel.rampVolSurroundSL = static_cast<int32>(slVol * 4096.0f);
+		channel.rampVolSurroundFL = static_cast<int32>(flVol * 4096.0f);
+		channel.rampVolSurroundC = static_cast<int32>(cVol * 4096.0f);
+		channel.rampVolSurroundFR = static_cast<int32>(frVol * 4096.0f);
+		channel.rampVolSurroundSR = static_cast<int32>(srVol * 4096.0f);
+		channel.attackRampRemaining = attackRemain;
+	}
+
+	MPT_ATTR_ALWAYSINLINE MPT_INLINE_FORCE void operator() (const typename Traits::outbuf_t &outSample, const ModChannel &chn, typename Traits::output_t * const outBuffer)
+	{
+		lRamp += chn.leftRamp;
+		rRamp += chn.rightRamp;
+		slVol += slRamp;
+		flVol += flRamp;
+		cVol += cRamp;
+		frVol += frRamp;
+		srVol += srRamp;
+		
+		// Input: mono or stereo sample - fold to mono first
+		typename Traits::output_t mono = outSample[0];
+		if(Traits::numChannelsIn == 2)
+		{
+			mono = (outSample[0] + outSample[1]) * 0.5f;
+		}
+
+		// Apply short attack fade if active
+		if(attackRemain > 0 && attackLen > 0)
+		{
+			const uint32 progressed = attackLen - attackRemain;
+			const float fade = static_cast<float>(std::min<uint32>(attackLen, progressed + 1)) / static_cast<float>(attackLen);
+			mono *= fade;
+			attackRemain--;
+		}
+
+		// Apply ramped gains directly (same as stereo ramp mixer does)
+		// Gains are already in 0-1 range and smoothly ramped per-sample
+		outBuffer[0] += mono * slVol;
+		outBuffer[1] += mono * flVol;
+		outBuffer[2] += mono * cVol;
+		outBuffer[3] += mono * frVol;
+		outBuffer[4] += mono * srVol;
 	}
 };
 
